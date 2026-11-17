@@ -1,0 +1,371 @@
+name: Radiance65 firmware release
+
+# Tag push builds and publishes. Manual runs only build.
+on:
+  push:
+    tags:
+      - '[0-9]*'
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'one = a single image, all = all 31'
+        type: choice
+        options:
+          - one
+          - all
+        default: one
+      ms:
+        description: 'debounce window in ms (one mode)'
+        default: '5'
+      algorithm:
+        description: 'debounce algorithm (one mode)'
+        default: sym_defer_pk
+
+permissions:
+  contents: write
+  actions: read
+
+concurrency:
+  group: radiance65-firmware-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  SHELL: /bin/bash
+  QMK_HOME: ${{ github.workspace }}
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 1 stock image
+  # ---------------------------------------------------------------------------
+  build-stock:
+    name: stock
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    if: github.event_name != 'workflow_dispatch' || inputs.mode == 'all'
+    container: ghcr.io/qmk/qmk_cli@sha256:2dc05fc9f32efebd6b05c2b8676ee548358bc7e151e9dbf4dac6b6eed4513b07
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Prepare workspace
+        run: |
+          git config --global --add safe.directory "$(pwd)"
+          # restore exec bits lost by a Windows checkout
+          find . -type f -name '*.sh' -not -path './.git/*' -exec chmod +x {} +
+          arm-none-eabi-gcc --version
+          python3 --version
+
+      - name: Check the tree's Python requirements
+        run: |
+          set -euo pipefail
+          if ! python3 -c "import appdirs, argcomplete, colorama, hid, hjson, jsonschema, milc, pygments, usb.core, dotty_dict, PIL"; then
+            echo "installing missing modules from this tree's requirements.txt"
+            python3 -m pip install --disable-pip-version-check --no-input -r requirements.txt
+          fi
+          python3 -c "import appdirs, argcomplete, colorama, hid, hjson, jsonschema, milc, pygments, usb.core, dotty_dict, PIL"
+          echo "all Python requirements importable"
+
+      - name: Build
+        run: |
+          set -euo pipefail
+          grep -n 'DEBOUNCE' keyboards/radiance/config.h keyboards/radiance/rules.mk || true
+          make radiance:vial -j"$(nproc)" 2>&1 | tee build.log
+
+          mapfile -t pkgs < <(find . -type f -name '*.vfw' -print | sort)
+          echo "update packages found: ${pkgs[*]:-<none>}"
+          if [ "${#pkgs[@]}" -ne 1 ]; then
+            echo "::error::expected exactly one .vfw after the build, found ${#pkgs[@]}"
+            echo "cwd: $(pwd)"
+            echo "--- firmware files on disk ---"
+            find . -type f \( -name '*.vfw' -o -name '*.bin' -o -name '*.elf' -o -name '*.hex' \) -print | sort
+            echo "--- package creation lines ---"
+            grep -nE 'Vial update package|Copying .* to qmk_firmware|Permission denied|No rule to make target' build.log || true
+            echo "--- tail of build.log ---"
+            tail -n 40 build.log
+            exit 1
+          fi
+          if [ "${pkgs[0]}" != "./radiance_vial.vfw" ]; then
+            mv -f "${pkgs[0]}" radiance_vial.vfw
+          fi
+          ls -l radiance_vial.vfw
+
+      - name: Verify update package
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib
+          import pathlib
+          import sys
+
+          data = pathlib.Path("radiance_vial.vfw").read_bytes()
+          if data[:8] != b"VIALFW01":
+              sys.exit("bad magic: %r" % data[:8])
+          if data[8:16].hex().upper() != "D0466FC78C506A15":
+              sys.exit("unexpected Vial UID in package header")
+          if hashlib.sha256(data[64:]).hexdigest() != data[32:64].hex():
+              sys.exit("payload hash mismatch")
+          size = len(data) - 64
+          if size > 52224:
+              sys.exit("image is %d bytes, app slot is 52224" % size)
+          print("ok: %d bytes, %d bytes free in the app slot" % (size, 52224 - size))
+          PY
+
+      - name: Rename to release asset name
+        run: |
+          set -euo pipefail
+          mv radiance_vial.vfw radiance65-stock.vfw
+          ls -l radiance65-stock.vfw
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: radiance65-stock.vfw
+          path: radiance65-stock.vfw
+          if-no-files-found: error
+          retention-days: 7
+
+  # ---------------------------------------------------------------------------
+  # 5 windows x 6 algorithms
+  # ---------------------------------------------------------------------------
+  build-variant:
+    name: ${{ matrix.value }}ms-${{ matrix.type }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    container: ghcr.io/qmk/qmk_cli@sha256:2dc05fc9f32efebd6b05c2b8676ee548358bc7e151e9dbf4dac6b6eed4513b07
+    strategy:
+      fail-fast: false
+      matrix:
+        value: ${{ fromJSON((github.event_name == 'workflow_dispatch' && inputs.mode == 'one') && format('[{0}]', inputs.ms) || '[2,3,5,8,10]') }}
+        type: ${{ fromJSON((github.event_name == 'workflow_dispatch' && inputs.mode == 'one') && format('["{0}"]', inputs.algorithm) || '["sym_defer_g","sym_defer_pr","sym_defer_pk","sym_eager_pr","sym_eager_pk","asym_eager_defer_pk"]') }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Prepare workspace
+        run: |
+          git config --global --add safe.directory "$(pwd)"
+          # restore exec bits lost by a Windows checkout
+          find . -type f -name '*.sh' -not -path './.git/*' -exec chmod +x {} +
+          arm-none-eabi-gcc --version
+          python3 --version
+
+      - name: Check the tree's Python requirements
+        run: |
+          set -euo pipefail
+          if ! python3 -c "import appdirs, argcomplete, colorama, hid, hjson, jsonschema, milc, pygments, usb.core, dotty_dict, PIL"; then
+            echo "installing missing modules from this tree's requirements.txt"
+            python3 -m pip install --disable-pip-version-check --no-input -r requirements.txt
+          fi
+          python3 -c "import appdirs, argcomplete, colorama, hid, hjson, jsonschema, milc, pygments, usb.core, dotty_dict, PIL"
+          echo "all Python requirements importable"
+
+      - name: Apply variant settings
+        env:
+          DEBOUNCE_MS: ${{ matrix.value }}
+          DEBOUNCE_TYPE_NAME: ${{ matrix.type }}
+        run: |
+          set -euo pipefail
+          sed -i -E "s/^#define[[:space:]]+DEBOUNCE[[:space:]]+.*/#define DEBOUNCE    ${DEBOUNCE_MS}/" \
+            keyboards/radiance/config.h
+          # variants ship without the USB console and the legacy shift-chord commands; the stock image keeps them
+          printf '\nDEBOUNCE_TYPE = %s\nCONSOLE_ENABLE = no\nCOMMAND_ENABLE = no\n' \
+            "${DEBOUNCE_TYPE_NAME}" >> keyboards/radiance/rules.mk
+          grep -nE 'DEBOUNCE|CONSOLE_ENABLE|COMMAND_ENABLE' keyboards/radiance/config.h keyboards/radiance/rules.mk
+
+      - name: Build
+        run: |
+          set -euo pipefail
+          make radiance:vial -j"$(nproc)" 2>&1 | tee build.log
+
+          mapfile -t pkgs < <(find . -type f -name '*.vfw' -print | sort)
+          echo "update packages found: ${pkgs[*]:-<none>}"
+          if [ "${#pkgs[@]}" -ne 1 ]; then
+            echo "::error::expected exactly one .vfw after the build, found ${#pkgs[@]}"
+            echo "cwd: $(pwd)"
+            echo "--- firmware files on disk ---"
+            find . -type f \( -name '*.vfw' -o -name '*.bin' -o -name '*.elf' -o -name '*.hex' \) -print | sort
+            echo "--- package creation lines ---"
+            grep -nE 'Vial update package|Copying .* to qmk_firmware|Permission denied|No rule to make target' build.log || true
+            echo "--- tail of build.log ---"
+            tail -n 40 build.log
+            exit 1
+          fi
+          if [ "${pkgs[0]}" != "./radiance_vial.vfw" ]; then
+            mv -f "${pkgs[0]}" radiance_vial.vfw
+          fi
+          ls -l radiance_vial.vfw
+
+      - name: Confirm the requested algorithm was compiled
+        env:
+          DEBOUNCE_TYPE_NAME: ${{ matrix.type }}
+        run: |
+          set -euo pipefail
+          mapfile -t built < <(sed -n 's/.*Compiling: quantum\/debounce\/\([A-Za-z0-9_]*\)\.c.*/\1/p' build.log | sort -u)
+
+          if [ "${#built[@]}" -eq 0 ]; then
+            mapfile -t built < <(find . -type f -name '*.o' -path '*debounce*' -exec basename {} .o \; | sort -u)
+          fi
+
+          echo "debounce modules compiled: ${built[*]:-<none>}"
+          if [ "${#built[@]}" -ne 1 ] || [ "${built[0]}" != "${DEBOUNCE_TYPE_NAME}" ]; then
+            echo "::error::expected exactly ${DEBOUNCE_TYPE_NAME}, got: ${built[*]:-<none>}"
+            echo "--- debounce objects on disk ---"
+            find . -type f -name '*.o' -path '*debounce*' -print || true
+            echo "--- build directories ---"
+            find . -maxdepth 3 -type d -name '.build' -print || true
+            grep -n 'debounce' build.log | tail -20 || true
+            exit 1
+          fi
+          echo "ok: only ${DEBOUNCE_TYPE_NAME} was compiled"
+
+      - name: Verify update package
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib
+          import pathlib
+          import sys
+
+          data = pathlib.Path("radiance_vial.vfw").read_bytes()
+          if data[:8] != b"VIALFW01":
+              sys.exit("bad magic: %r" % data[:8])
+          if data[8:16].hex().upper() != "D0466FC78C506A15":
+              sys.exit("unexpected Vial UID in package header")
+          if hashlib.sha256(data[64:]).hexdigest() != data[32:64].hex():
+              sys.exit("payload hash mismatch")
+          size = len(data) - 64
+          if size > 52224:
+              sys.exit("image is %d bytes, app slot is 52224" % size)
+          print("ok: %d bytes, %d bytes free in the app slot" % (size, 52224 - size))
+          PY
+
+      - name: Rename to release asset name
+        env:
+          DEBOUNCE_MS: ${{ matrix.value }}
+          DEBOUNCE_TYPE_NAME: ${{ matrix.type }}
+        run: |
+          set -euo pipefail
+          asset="radiance65-${DEBOUNCE_MS}ms-${DEBOUNCE_TYPE_NAME}.vfw"
+          mv radiance_vial.vfw "$asset"
+          ls -l "$asset"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: radiance65-${{ matrix.value }}ms-${{ matrix.type }}.vfw
+          path: radiance65-${{ matrix.value }}ms-${{ matrix.type }}.vfw
+          if-no-files-found: error
+          retention-days: 7
+
+  # ---------------------------------------------------------------------------
+  # Publish
+  # ---------------------------------------------------------------------------
+  publish:
+    name: publish release
+    needs:
+      - build-stock
+      - build-variant
+    if: github.event_name == 'push'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Work out the tag and commit
+        id: src
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          sha=$(gh api "repos/${GH_REPO}/commits/${TAG}" --jq .sha)
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "sha=${sha}" >> "$GITHUB_OUTPUT"
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Check downloaded assets
+        run: |
+          set -euo pipefail
+          find dist -maxdepth 1 -type f -printf '%f\n' | sort
+          count=$(find dist -maxdepth 1 -type f -name '*.vfw' | wc -l)
+          echo "assets: $count"
+          test "$count" -eq 31
+
+      - name: Create draft release and upload assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # this job has no checkout, so name the repo for gh
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ steps.src.outputs.tag }}
+          SHA: ${{ steps.src.outputs.sha }}
+        run: |
+          set -euo pipefail
+
+          # stock first, then each window with its six algorithms
+          {
+            echo "radiance65-stock.vfw"
+            for ms in 2 3 5 8 10; do
+              for type in sym_defer_g sym_defer_pr sym_defer_pk \
+                          sym_eager_pr sym_eager_pk asym_eager_defer_pk; do
+                echo "radiance65-${ms}ms-${type}.vfw"
+              done
+            done
+          } > order.txt
+
+          missing=0
+          while IFS= read -r name; do
+            if [ ! -f "dist/${name}" ]; then
+              echo "::error::missing asset ${name}"
+              missing=1
+            fi
+          done < order.txt
+          test "$missing" -eq 0
+
+          # replace a leftover draft
+          state=$(gh release view "$TAG" --json isDraft -q .isDraft 2>/dev/null || echo missing)
+          if [ "$state" = "true" ]; then
+            echo "removing leftover draft release for ${TAG}"
+            gh release delete "$TAG" --yes
+          elif [ "$state" = "false" ]; then
+            echo "::error::release ${TAG} already exists; bump the tag or delete the release first"
+            exit 1
+          fi
+
+          build_date=$(date -u '+%Y-%m-%d %H:%M UTC')
+          cat > notes.md <<EOF
+          Firmware images for the SR Studio Radiance65 (STM32F103, vibl bootloader, Vial keymap).
+
+          Source: ${GITHUB_REPOSITORY} @ ${SHA}
+          Build date: ${build_date}
+
+          31 images: 1 stock + 5 debounce windows x 6 algorithms.
+
+          * radiance65-stock.vfw - unmodified firmware (DEBOUNCE 1, sym_defer_g)
+          * radiance65-<window>ms-<algorithm>.vfw - window is 2, 3, 5, 8 or 10 ms
+
+          Debounce algorithms:
+          * sym_defer_g - deferred, one global timer for the whole matrix
+          * sym_defer_pr - deferred, one timer per matrix row
+          * sym_defer_pk - deferred, one timer per key
+          * sym_eager_pr - eager, one timer per matrix row
+          * sym_eager_pk - eager, one timer per key
+          * asym_eager_defer_pk - eager key-down, deferred key-up, per key
+          EOF
+
+          gh release create "$TAG" --draft --title "$TAG" --notes-file notes.md
+
+          while IFS= read -r name; do
+            echo "uploading ${name}"
+            gh release upload "$TAG" "dist/${name}"
+          done < order.txt
+
+          gh release edit "$TAG" --draft=false
+          echo "published ${TAG} with $(wc -l < order.txt) assets"
